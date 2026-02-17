@@ -99,8 +99,8 @@ def setup_logging() -> None:
     root = logging.getLogger()
     root.setLevel(level)
 
-    # Console handler
-    console = logging.StreamHandler(sys.stdout)
+    # Console handler — use stderr to avoid corrupting MCP stdio transport on stdout
+    console = logging.StreamHandler(sys.stderr)
     console.setFormatter(formatter)
     root.addHandler(console)
 
