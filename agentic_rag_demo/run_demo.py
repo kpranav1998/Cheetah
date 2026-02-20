@@ -47,16 +47,15 @@ from evaluator import RAGEvaluator
 
 
 # ── Model config ──────────────────────────────────────────────
-# Change this one line to switch the LLM backend everywhere.
+# Set via environment variable (recommended) or change the fallback below.
 #
-#   Local Ollama (default):  "ollama/llama3.2"
-#                            "ollama/mistral"
-#                            "ollama/qwen2.5"
-#   OpenAI (Colab/cloud):    "gpt-4o-mini"
-#   Anthropic:               "claude-haiku-4-5-20251001"
+#   export LITELLM_MODEL=ollama/llama3.2        # local Ollama (default)
+#   export LITELLM_MODEL=ollama/mistral
+#   export LITELLM_MODEL=gpt-4o-mini            # OpenAI
+#   export LITELLM_MODEL=claude-haiku-4-5-20251001  # Anthropic
 #
 # Ollama must be running:  ollama serve && ollama pull llama3.2
-LLM_MODEL = "ollama/llama3.2"
+LLM_MODEL = os.environ.get("LITELLM_MODEL", "ollama/llama3.2")
 
 
 console = Console()
