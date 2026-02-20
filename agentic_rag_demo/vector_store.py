@@ -16,7 +16,7 @@ HOW COSINE SIMILARITY WORKS:
 """
 
 from dataclasses import dataclass, field
-from typing import List, Tuple
+from typing import Dict, List, Optional
 import numpy as np
 
 
@@ -67,40 +67,68 @@ class VectorStore:
             self._embeddings.append(np.array(emb, dtype=np.float32))
 
     # ── Retrieval ────────────────────────────────────────────────
-    def search(self, query_embedding: List[float], k: int = 5) -> List[SearchResult]:
+    def search(
+        self,
+        query_embedding: List[float],
+        k: int = 5,
+        filter: Optional[Dict] = None,
+    ) -> List[SearchResult]:
         """
         Retrieve top-k most similar chunks using cosine similarity.
 
-        Steps:
-          1. Stack all embeddings into a matrix (N × D)
-          2. Normalise query and matrix rows to unit length
-          3. Dot product gives cosine similarities in one shot (O(N×D))
-          4. argsort and take top-k
+        filter: optional dict of metadata conditions — ALL must match (AND logic).
+          Examples:
+            filter={"doc_title": "RSI - Relative Strength Index"}
+            filter={"doc_id": "doc_2"}
+            filter={"strategy": "recursive"}
+
+        How metadata filtering works:
+          1. Build a candidate list — only indices where every filter key matches
+          2. Slice the embedding matrix to those candidates only
+          3. Run cosine similarity on the reduced matrix (faster + scoped)
+          4. Return top-k from the filtered candidates
+
+        This is the same pre-filtering logic used by ChromaDB's `where` clause,
+        Pinecone's `filter`, and Weaviate's `where` filter.
         """
         if not self._embeddings:
             return []
 
-        q = np.array(query_embedding, dtype=np.float32)
-        matrix = np.stack(self._embeddings)          # shape: (N, D)
+        # ── Step 1: apply metadata filter ────────────────────────
+        if filter:
+            candidate_idx = [
+                i for i, c in enumerate(self._chunks)
+                if all(c.get(key) == val for key, val in filter.items())
+            ]
+            if not candidate_idx:
+                return []  # nothing matches — return empty rather than error
+        else:
+            candidate_idx = list(range(len(self._chunks)))
 
-        # Normalise — prevents longer texts (bigger magnitude) from dominating
+        # ── Step 2: build matrix from candidates only ─────────────
+        q = np.array(query_embedding, dtype=np.float32)
+        matrix = np.stack([self._embeddings[i] for i in candidate_idx])  # (M, D)
+
+        # ── Step 3: normalised cosine similarity ──────────────────
         q_norm = q / (np.linalg.norm(q) + 1e-10)
         m_norms = np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-10
         m_norm = matrix / m_norms
+        similarities = m_norm @ q_norm                  # shape: (M,)
 
-        similarities = m_norm @ q_norm               # shape: (N,)
-
-        top_k_idx = np.argsort(similarities)[-k:][::-1]  # descending
+        # ── Step 4: top-k from filtered candidates ────────────────
+        actual_k = min(k, len(candidate_idx))
+        top_local = np.argsort(similarities)[-actual_k:][::-1]
 
         results = []
-        for idx in top_k_idx:
-            c = self._chunks[idx]
+        for local_i in top_local:
+            global_i = candidate_idx[local_i]
+            c = self._chunks[global_i]
             results.append(SearchResult(
                 text=c["text"],
                 doc_title=c["doc_title"],
                 doc_id=c["doc_id"],
                 chunk_index=c["chunk_index"],
-                score=float(similarities[idx]),
+                score=float(similarities[local_i]),
                 strategy=c["strategy"],
             ))
         return results

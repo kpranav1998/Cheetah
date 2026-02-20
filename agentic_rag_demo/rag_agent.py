@@ -4,33 +4,46 @@ rag_agent.py
 Two RAG implementations to contrast:
 
   1. NaiveRAG   — one-shot: query → retrieve once → answer
-  2. AgenticRAG — multi-step: agent decides WHEN and HOW MANY TIMES to retrieve
+  2. AgenticRAG — multi-step: agent decides WHEN and HOW MANY TIMES to retrieve,
+                  and CAN filter by document using metadata
 
-WHY AGENTIC RAG?
-  Naive RAG fails on:
-  - Multi-hop questions  (need to retrieve from 2+ topics)
-  - Complex questions    (need to decompose into sub-queries)
-  - No-retrieval cases   (LLM knows the answer; retrieval adds noise)
-  - Bad initial queries  (agent can reformulate if first search misses)
+LLM BACKEND — LiteLLM
+  LiteLLM is a unified gateway: one API, any model.
+  Switch models by changing the model string:
 
-  Agentic RAG uses OpenAI's tool calling so the LLM decides:
-    • Whether to search at all
-    • What query to use
-    • Whether the results are sufficient or to search again with a different angle
-    • How to synthesize multiple pieces of retrieved context
+    "ollama/llama3.2"          → Ollama running locally (default)
+    "ollama/mistral"           → Mistral via Ollama
+    "gpt-4o-mini"              → OpenAI (needs OPENAI_API_KEY)
+    "claude-haiku-4-5-20251001" → Anthropic (needs ANTHROPIC_API_KEY)
+
+  For Ollama, start the server first:
+    ollama serve
+    ollama pull llama3.2
+
+  Tool calling (function calling) is required for AgenticRAG.
+  Ollama models with tool support: llama3.1, llama3.2, mistral, qwen2.5
+
+METADATA FILTERING
+  AgenticRAG now exposes doc_title as an optional filter in the search tool.
+  The agent can:
+    1. Call list_available_topics() to see all document titles
+    2. Call search_knowledge_base(query, doc_title="RSI - Relative Strength Index")
+       to restrict search to that one document's chunks — guaranteed precision.
 """
 
 import json
-import os
-from typing import List
+from typing import List, Optional
 
-from openai import OpenAI
+import litellm
 
 from embedder import Embedder
 from vector_store import VectorStore
 
 
-CHAT_MODEL = "gpt-4o-mini"
+# ─────────────────────────────────────────────────────────────
+# Default model — change this to switch backends
+# ─────────────────────────────────────────────────────────────
+DEFAULT_MODEL = "ollama/llama3.2"   # swap to "gpt-4o-mini" for Colab / OpenAI
 
 
 # ─────────────────────────────────────────────────────────────
@@ -44,17 +57,18 @@ class NaiveRAG:
     No loops, no decisions, no reformulation.
     """
 
-    def __init__(self, store: VectorStore, embedder: Embedder, k: int = 4):
+    def __init__(self, store: VectorStore, embedder: Embedder, k: int = 4,
+                 model: str = DEFAULT_MODEL):
         self.store = store
         self.embedder = embedder
-        self.client = OpenAI()
+        self.model = model
         self.k = k
 
     def query(self, question: str) -> dict:
         # Step 1: embed the raw user question
         q_emb = self.embedder.embed(question)
 
-        # Step 2: retrieve top-k chunks
+        # Step 2: retrieve top-k chunks (no filter — searches everything)
         results = self.store.search(q_emb, k=self.k)
 
         # Step 3: build context string
@@ -62,9 +76,9 @@ class NaiveRAG:
             f"[{r.doc_title}]\n{r.text}" for r in results
         )
 
-        # Step 4: one-shot generation
-        response = self.client.chat.completions.create(
-            model=CHAT_MODEL,
+        # Step 4: one-shot generation via LiteLLM
+        response = litellm.completion(
+            model=self.model,
             messages=[
                 {
                     "role": "system",
@@ -82,34 +96,39 @@ class NaiveRAG:
         )
 
         return {
-            "question":    question,
-            "answer":      response.choices[0].message.content,
+            "question":     question,
+            "answer":       response.choices[0].message.content,
             "n_retrievals": 1,
-            "retrieved":   [{"title": r.doc_title, "score": r.score, "text": r.text} for r in results],
-            "mode":        "naive",
+            "retrieved":    [{"title": r.doc_title, "score": r.score, "text": r.text}
+                             for r in results],
+            "mode":         "naive",
         }
 
 
 # ─────────────────────────────────────────────────────────────
-# 2. Agentic RAG — multi-step with tool calling
+# 2. Agentic RAG — multi-step with tool calling + metadata filter
 # ─────────────────────────────────────────────────────────────
 class AgenticRAG:
     """
     RAG where the LLM is the decision-maker.
 
-    The LLM is given two tools:
-      search_knowledge_base(query, n_results)  — semantic search
-      list_available_topics()                  — see what docs exist
+    Tools available to the agent:
+      search_knowledge_base(query, n_results, doc_title?)
+        — semantic search, optionally scoped to one document via metadata filter
+      list_available_topics()
+        — returns all document titles so the agent can pick the right one
 
-    The agent can:
-      • Call search multiple times with different queries
-      • List topics first to understand what's available
-      • Choose NOT to search (for general-knowledge questions)
-      • Reformulate a query if the first results are poor
-      • Decompose a multi-part question into separate searches
+    With metadata filtering, the agent workflow becomes:
+      1. list_available_topics()            → sees ["RSI", "MACD", "Momentum", ...]
+      2. search_knowledge_base(             → scoped to exactly the RSI document
+             query="overbought signals",
+             doc_title="RSI - Relative Strength Index")
+      3. search_knowledge_base(             → scoped to MACD document
+             query="bullish crossover",
+             doc_title="MACD Indicator")
+      4. Synthesise answer from both filtered results
     """
 
-    # Tools exposed to the LLM via OpenAI function calling
     TOOLS = [
         {
             "type": "function",
@@ -117,8 +136,9 @@ class AgenticRAG:
                 "name": "search_knowledge_base",
                 "description": (
                     "Search the trading knowledge base for relevant information. "
-                    "Call this multiple times with DIFFERENT, SPECIFIC queries "
-                    "to cover all aspects of a complex question."
+                    "Optionally restrict to a specific document with doc_title "
+                    "(use list_available_topics first to get exact titles). "
+                    "Call multiple times with different queries to cover a complex question."
                 ),
                 "parameters": {
                     "type": "object",
@@ -132,6 +152,14 @@ class AgenticRAG:
                             "description": "Number of chunks to retrieve (1-5). Default 3.",
                             "default": 3,
                         },
+                        "doc_title": {
+                            "type": "string",
+                            "description": (
+                                "Optional. Restrict search to this document title only. "
+                                "Must exactly match a title from list_available_topics. "
+                                "Use when you know exactly which document contains the answer."
+                            ),
+                        },
                     },
                     "required": ["query"],
                 },
@@ -142,8 +170,9 @@ class AgenticRAG:
             "function": {
                 "name": "list_available_topics",
                 "description": (
-                    "List all document topics available in the knowledge base. "
-                    "Use this first if you are unsure what information exists."
+                    "List all document titles in the knowledge base. "
+                    "Call this first to understand what information is available, "
+                    "then use doc_title in search_knowledge_base to filter precisely."
                 ),
                 "parameters": {"type": "object", "properties": {}},
             },
@@ -158,21 +187,26 @@ Guidelines:
 1. THINK before searching — is this a general knowledge question (e.g. math) that doesn't need retrieval?
 2. For trading-specific questions, ALWAYS search the knowledge base.
 3. For COMPLEX questions with multiple parts, search MULTIPLE TIMES with different focused queries.
-4. If your first search doesn't give enough information, REFORMULATE and search again.
-5. Synthesize all retrieved information into a coherent, accurate answer.
-6. Never make up facts — only use what's in the retrieved context.
+4. Use list_available_topics() to discover document titles, then use doc_title filter in
+   search_knowledge_base() to restrict search to the most relevant document.
+5. If your first search doesn't give enough information, REFORMULATE and search again.
+6. Synthesize all retrieved information into a coherent, accurate answer.
+7. Never make up facts — only use what's in the retrieved context.
 """
 
-    def __init__(self, store: VectorStore, embedder: Embedder, max_iterations: int = 6):
+    def __init__(self, store: VectorStore, embedder: Embedder,
+                 max_iterations: int = 6, model: str = DEFAULT_MODEL):
         self.store = store
         self.embedder = embedder
-        self.client = OpenAI()
+        self.model = model
         self.max_iterations = max_iterations
 
-    def _do_search(self, query: str, n_results: int = 3) -> List[dict]:
-        """Internal: embed query and search the store."""
+    def _do_search(self, query: str, n_results: int = 3,
+                   doc_title: Optional[str] = None) -> List[dict]:
+        """Embed query, optionally apply doc_title metadata filter, search."""
         q_emb = self.embedder.embed(query)
-        results = self.store.search(q_emb, k=n_results)
+        filter_dict = {"doc_title": doc_title} if doc_title else None
+        results = self.store.search(q_emb, k=n_results, filter=filter_dict)
         return [
             {
                 "title": r.doc_title,
@@ -182,9 +216,26 @@ Guidelines:
             for r in results
         ]
 
+    def _serialize_message(self, msg) -> dict:
+        """Convert a LiteLLM/OpenAI message object to a plain dict for the next turn."""
+        entry: dict = {"role": "assistant", "content": msg.content or ""}
+        if msg.tool_calls:
+            entry["tool_calls"] = [
+                {
+                    "id":   tc.id,
+                    "type": "function",
+                    "function": {
+                        "name":      tc.function.name,
+                        "arguments": tc.function.arguments,
+                    },
+                }
+                for tc in msg.tool_calls
+            ]
+        return entry
+
     def query(self, question: str, verbose: bool = True) -> dict:
         """
-        Run the agentic RAG loop.
+        Run the agentic RAG loop via LiteLLM.
 
         The loop continues as long as the LLM calls tools.
         When the LLM produces a message WITHOUT tool calls, that is the final answer.
@@ -194,36 +245,36 @@ Guidelines:
             {"role": "user",   "content": question},
         ]
 
-        retrieval_log = []   # track all searches made by the agent
+        retrieval_log = []
 
         if verbose:
-            print(f"\n  [Agent] Starting query: '{question}'")
+            print(f"\n  [Agent/{self.model}] '{question}'")
 
         for iteration in range(self.max_iterations):
-            response = self.client.chat.completions.create(
-                model=CHAT_MODEL,
+            response = litellm.completion(
+                model=self.model,
                 messages=messages,
                 tools=self.TOOLS,
-                tool_choice="auto",  # LLM decides: call a tool OR answer directly
+                tool_choice="auto",
             )
 
             msg = response.choices[0].message
 
-            # ── No tool calls → LLM produced the final answer ──────────────
+            # ── No tool calls → LLM produced the final answer ──────
             if not msg.tool_calls:
                 if verbose:
-                    print(f"  [Agent] Done after {len(retrieval_log)} retrieval(s). Generating answer.")
+                    print(f"  [Agent] Done — {len(retrieval_log)} retrieval(s).")
                 return {
-                    "question":     question,
-                    "answer":       msg.content,
-                    "n_retrievals": len(retrieval_log),
+                    "question":      question,
+                    "answer":        msg.content,
+                    "n_retrievals":  len(retrieval_log),
                     "retrieval_log": retrieval_log,
-                    "messages":     messages,
-                    "mode":         "agentic",
+                    "messages":      messages,
+                    "mode":          "agentic",
                 }
 
-            # ── Handle tool calls ───────────────────────────────────────────
-            messages.append(msg)  # important: add assistant message before tool results
+            # Serialize assistant message as dict before appending
+            messages.append(self._serialize_message(msg))
 
             for tool_call in msg.tool_calls:
                 func_name = tool_call.function.name
@@ -231,18 +282,23 @@ Guidelines:
 
                 if func_name == "search_knowledge_base":
                     query_str = func_args["query"]
-                    n = func_args.get("n_results", 3)
-                    search_results = self._do_search(query_str, n_results=n)
+                    n         = func_args.get("n_results", 3)
+                    doc_title = func_args.get("doc_title")    # may be None
+
+                    search_results = self._do_search(query_str, n_results=n,
+                                                     doc_title=doc_title)
 
                     retrieval_log.append({
                         "iteration": iteration + 1,
                         "query":     query_str,
+                        "filter":    {"doc_title": doc_title} if doc_title else {},
                         "n_results": n,
                         "results":   search_results,
                     })
 
                     if verbose:
-                        print(f"  [Search #{len(retrieval_log)}] '{query_str}' → {len(search_results)} results")
+                        scope = f" [filter: {doc_title}]" if doc_title else ""
+                        print(f"  [Search #{len(retrieval_log)}] '{query_str}'{scope}")
                         for r in search_results:
                             preview = r["text"][:70].replace("\n", " ")
                             print(f"      [{r['score']:.3f}] {r['title']}: {preview}...")
@@ -258,19 +314,17 @@ Guidelines:
                 else:
                     tool_result = json.dumps({"error": f"Unknown tool: {func_name}"})
 
-                # Feed the tool result back into the conversation
                 messages.append({
                     "role":         "tool",
                     "tool_call_id": tool_call.id,
                     "content":      tool_result,
                 })
 
-        # Fallback — shouldn't normally reach here
         return {
-            "question":     question,
-            "answer":       "Max iterations reached without a final answer.",
-            "n_retrievals": len(retrieval_log),
+            "question":      question,
+            "answer":        "Max iterations reached without a final answer.",
+            "n_retrievals":  len(retrieval_log),
             "retrieval_log": retrieval_log,
-            "messages":     messages,
-            "mode":         "agentic",
+            "messages":      messages,
+            "mode":          "agentic",
         }

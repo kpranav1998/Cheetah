@@ -43,6 +43,19 @@ from rag_agent import NaiveRAG, AgenticRAG
 from evaluator import RAGEvaluator
 
 
+# ── Model config ──────────────────────────────────────────────
+# Change this one line to switch the LLM backend everywhere.
+#
+#   Local Ollama (default):  "ollama/llama3.2"
+#                            "ollama/mistral"
+#                            "ollama/qwen2.5"
+#   OpenAI (Colab/cloud):    "gpt-4o-mini"
+#   Anthropic:               "claude-haiku-4-5-20251001"
+#
+# Ollama must be running:  ollama serve && ollama pull llama3.2
+LLM_MODEL = "ollama/llama3.2"
+
+
 console = Console()
 
 
@@ -195,8 +208,8 @@ def run_queries(store: VectorStore, embedder: Embedder) -> tuple:
     """Run both naive and agentic RAG on all test questions."""
     console.print(Rule("[bold blue]SECTION 3 & 4: NAIVE RAG vs AGENTIC RAG[/bold blue]"))
 
-    naive_rag   = NaiveRAG(store, embedder, k=4)
-    agentic_rag = AgenticRAG(store, embedder, max_iterations=6)
+    naive_rag   = NaiveRAG(store, embedder, k=4, model=LLM_MODEL)
+    agentic_rag = AgenticRAG(store, embedder, max_iterations=6, model=LLM_MODEL)
 
     naive_results   = []
     agentic_results = []
@@ -244,7 +257,7 @@ def run_evaluation(naive_results: list, agentic_results: list, embedder: Embedde
         "  [bold]Context Recall[/bold]    — Did retrieval capture the info needed to answer?\n"
     )
 
-    evaluator = RAGEvaluator(embedder)
+    evaluator = RAGEvaluator(embedder, judge_model=LLM_MODEL)
 
     # Build results table
     table = Table(title="RAG Evaluation Results", show_lines=True)
@@ -379,7 +392,7 @@ def main():
     console.print(Panel(
         "[bold]Agentic RAG Demo[/bold]\n"
         "Knowledge Base: Trading Concepts (8 documents)\n"
-        f"LLM: gpt-4o-mini  │  Embeddings: {embedder.model_name} (local)  │  Vector DB: numpy",
+        f"LLM: {LLM_MODEL}  │  Embeddings: {embedder.model_name} (local)  │  Vector DB: numpy",
         style="bold magenta",
     ))
     console.print()

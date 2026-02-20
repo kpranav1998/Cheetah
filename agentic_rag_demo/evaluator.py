@@ -16,27 +16,28 @@ METRIC OVERVIEW:
   Faithfulness + Answer Relevance → quality of the GENERATOR
   Context Precision + Context Recall → quality of the RETRIEVER
 
-Each metric uses an LLM-as-judge approach (gpt-4o-mini) for flexibility.
+Each metric uses an LLM-as-judge approach via LiteLLM (works with Ollama or OpenAI).
 Answer Relevance also uses embedding similarity.
 """
 
 import json
+import re
 from typing import List, Optional
 
+import litellm
 import numpy as np
-from openai import OpenAI
 
 from embedder import Embedder
 
 
-JUDGE_MODEL = "gpt-4o-mini"
+DEFAULT_JUDGE_MODEL = "ollama/llama3.2"   # swap to "gpt-4o-mini" for OpenAI
 
 
 class RAGEvaluator:
 
-    def __init__(self, embedder: Embedder):
+    def __init__(self, embedder: Embedder, judge_model: str = DEFAULT_JUDGE_MODEL):
         self.embedder = embedder
-        self.client = OpenAI()
+        self.judge_model = judge_model
 
     # ── Helpers ──────────────────────────────────────────────────
     def _embed(self, text: str) -> np.ndarray:
@@ -46,13 +47,30 @@ class RAGEvaluator:
         return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-10))
 
     def _judge(self, prompt: str) -> dict:
-        """Call LLM-as-judge with JSON output mode."""
-        resp = self.client.chat.completions.create(
-            model=JUDGE_MODEL,
+        """
+        Call LLM-as-judge via LiteLLM and return parsed JSON.
+
+        response_format={"type": "json_object"} works for OpenAI models.
+        For Ollama, we request JSON in the prompt and extract it from the response.
+        """
+        resp = litellm.completion(
+            model=self.judge_model,
             messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
+            response_format={"type": "json_object"},  # honoured by OpenAI + some Ollama models
         )
-        return json.loads(resp.choices[0].message.content)
+        raw = resp.choices[0].message.content or "{}"
+
+        # Robust JSON extraction — handles markdown code fences Ollama sometimes adds
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            if match:
+                try:
+                    return json.loads(match.group())
+                except json.JSONDecodeError:
+                    pass
+        return {}
 
     # ── Metric 1: Faithfulness ────────────────────────────────────
     def faithfulness(self, question: str, answer: str, context: str) -> dict:
