@@ -289,6 +289,154 @@ async def list_available_patterns() -> str:
     return json.dumps(list(DETECTOR_MAP.keys()))
 
 
+@mcp.tool()
+@log_tool_call
+async def generate_pattern_report(
+    symbol: str | None = None,
+    timeframe: str = "1d",
+    start_date: str | None = None,
+    end_date: str | None = None,
+    csv_path: str | None = None,
+    pattern_names: str | None = None,
+) -> str:
+    """Scan for chart patterns, evaluate outcomes, display a formatted report, and save it to disk.
+
+    Args:
+        symbol: Ticker symbol (e.g. GOOGL, RELIANCE.NS)
+        timeframe: Candle timeframe (default 1d)
+        start_date: Start date YYYY-MM-DD
+        end_date: End date YYYY-MM-DD
+        csv_path: Path to CSV file (alternative to symbol)
+        pattern_names: Comma-separated pattern names to scan (e.g. "flag_pole,double_bottom"). If empty, scans all.
+
+    Returns:
+        Formatted text report with pattern details, outcomes, and summary statistics.
+        Also saved to storage/reports/.
+    """
+    df = _load_df(symbol=symbol, timeframe=timeframe, start_date=start_date, end_date=end_date, csv_path=csv_path)
+    if df.empty:
+        return "ERROR: No data found."
+
+    names_list = [n.strip() for n in pattern_names.split(",")] if pattern_names else None
+    matches = scan_patterns(df, names_list)
+
+    label = symbol or csv_path or "unknown"
+    lines: list[str] = []
+    lines.append("=" * 80)
+    lines.append(f"  PATTERN ANALYSIS REPORT — {label.upper()}")
+    lines.append("=" * 80)
+    lines.append(f"  Date range : {df.index[0].date()} to {df.index[-1].date()}")
+    lines.append(f"  Bars       : {len(df)}")
+    lines.append(f"  Price range: ${df['close'].min():.2f} – ${df['close'].max():.2f}")
+    scanned = ", ".join(names_list) if names_list else "all"
+    lines.append(f"  Patterns   : {scanned}")
+    lines.append(f"  Found      : {len(matches)} pattern(s)")
+    lines.append("=" * 80)
+
+    wins = 0
+    losses = 0
+    open_trades = 0
+    type_stats: dict[str, dict[str, int]] = {}
+
+    for idx, m in enumerate(matches, 1):
+        entry_price = df.iloc[m.end_idx]["close"]
+
+        # Evaluate outcome
+        post = df.iloc[m.end_idx + 1:] if m.end_idx + 1 < len(df) else df.iloc[0:0]
+        outcome = "Open / no resolution"
+        outcome_date = ""
+
+        if not post.empty:
+            if m.direction == "bullish":
+                target_hit = post[post["high"] >= m.target_price]
+                stop_hit = post[post["low"] <= m.stop_loss]
+            else:
+                target_hit = post[post["low"] <= m.target_price]
+                stop_hit = post[post["high"] >= m.stop_loss]
+
+            t_first = target_hit.index[0] if not target_hit.empty else None
+            s_first = stop_hit.index[0] if not stop_hit.empty else None
+
+            if t_first and (not s_first or t_first <= s_first):
+                days = (t_first - m.confirmation_timestamp).days
+                outcome = f"TARGET HIT ({days}d)"
+                outcome_date = str(t_first.date())
+                wins += 1
+            elif s_first and (not t_first or s_first < t_first):
+                days = (s_first - m.confirmation_timestamp).days
+                outcome = f"STOP HIT ({days}d)"
+                outcome_date = str(s_first.date())
+                losses += 1
+            else:
+                open_trades += 1
+        else:
+            open_trades += 1
+
+        # Track per-type stats
+        pt = m.pattern_type
+        if pt not in type_stats:
+            type_stats[pt] = {"wins": 0, "losses": 0, "open": 0}
+        if "TARGET" in outcome:
+            type_stats[pt]["wins"] += 1
+        elif "STOP" in outcome:
+            type_stats[pt]["losses"] += 1
+        else:
+            type_stats[pt]["open"] += 1
+
+        lines.append("")
+        lines.append(f"  Pattern #{idx}: {m.pattern_type.upper()}")
+        lines.append(f"  Direction    : {m.direction}")
+        lines.append(f"  Period       : {df.index[m.start_idx].date()} → {m.confirmation_timestamp.date()}")
+        lines.append(f"  Entry price  : ${entry_price:.2f}")
+        lines.append(f"  Target       : ${m.target_price:.2f}")
+        lines.append(f"  Stop loss    : ${m.stop_loss:.2f}")
+        lines.append(f"  Confidence   : {m.confidence:.0%}")
+        lines.append(f"  Pole move    : {m.metadata.get('pole_move_pct', 0):.1f}%")
+        lines.append(f"  Flag retrace : {m.metadata.get('flag_retrace_pct', 0):.1f}%")
+        lines.append(f"  Outcome      : {outcome}  {outcome_date}")
+        lines.append("-" * 80)
+
+    # Summary
+    total_resolved = wins + losses
+    win_rate = (wins / total_resolved * 100) if total_resolved else 0
+
+    lines.append("")
+    lines.append("=" * 80)
+    lines.append("  SUMMARY")
+    lines.append("=" * 80)
+    lines.append(f"  Total patterns : {len(matches)}")
+    lines.append(f"  Target hit     : {wins}")
+    lines.append(f"  Stop hit       : {losses}")
+    lines.append(f"  Open / pending : {open_trades}")
+    lines.append(f"  Win rate       : {win_rate:.0f}% ({wins}/{total_resolved} resolved)")
+    lines.append("")
+
+    if type_stats:
+        lines.append(f"  {'Pattern':<20} {'Wins':>6} {'Losses':>8} {'Open':>6} {'Win %':>7}")
+        lines.append(f"  {'-'*20} {'-'*6} {'-'*8} {'-'*6} {'-'*7}")
+        for pt, st in type_stats.items():
+            res = st["wins"] + st["losses"]
+            wr = (st["wins"] / res * 100) if res else 0
+            lines.append(f"  {pt:<20} {st['wins']:>6} {st['losses']:>8} {st['open']:>6} {wr:>6.0f}%")
+
+    lines.append("")
+    lines.append("=" * 80)
+
+    report_text = "\n".join(lines)
+
+    # Save to disk
+    reports_dir = Path(_PROJECT_ROOT) / "storage" / "reports"
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"pattern_{label.replace('.', '_')}_{ts}.txt"
+    report_path = reports_dir / filename
+    with open(report_path, "w") as f:
+        f.write(report_text)
+
+    report_text += f"\n\n  Report saved to: {report_path}"
+    return report_text
+
+
 # ===================================================================
 # BACKTESTING TOOLS
 # ===================================================================

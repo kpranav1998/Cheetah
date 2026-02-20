@@ -13,6 +13,7 @@ plotly>=5.18.0
 
 # LLM
 openai>=1.0.0
+sentence-transformers>=3.0.0
 litellm>=1.40.0
 
 # Agent
