@@ -15,7 +15,10 @@ Run:
   python run_demo.py
 
 Requirements:
-  OPENAI_API_KEY environment variable must be set.
+  Set LLM_MODEL near the top of this file, then set the matching env var:
+    ollama/*    → no key needed (ollama serve must be running)
+    gpt-*       → export OPENAI_API_KEY=sk-...
+    claude-*    → export ANTHROPIC_API_KEY=sk-ant-...
 """
 
 import os
@@ -379,11 +382,24 @@ def print_architecture():
 # ─────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────
+def _check_api_key(model: str) -> None:
+    """Validate that the required API key is set for the chosen model."""
+    if model.startswith("ollama/"):
+        return  # Ollama runs locally — no API key needed
+    if model.startswith(("gpt-", "openai/")):
+        if not os.environ.get("OPENAI_API_KEY"):
+            console.print("[bold red]Error:[/bold red] OPENAI_API_KEY not set.")
+            console.print("  export OPENAI_API_KEY=sk-...")
+            sys.exit(1)
+    elif model.startswith(("claude-", "anthropic/")):
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            console.print("[bold red]Error:[/bold red] ANTHROPIC_API_KEY not set.")
+            console.print("  export ANTHROPIC_API_KEY=sk-ant-...")
+            sys.exit(1)
+
+
 def main():
-    if not os.environ.get("OPENAI_API_KEY"):
-        console.print("[bold red]Error:[/bold red] OPENAI_API_KEY environment variable not set.")
-        console.print("  export OPENAI_API_KEY=sk-...")
-        sys.exit(1)
+    _check_api_key(LLM_MODEL)
 
     console.print()
     # Create one shared embedder — model loads once, reused everywhere
